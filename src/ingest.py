@@ -13,17 +13,16 @@ HEADERS = {
 }
 
 def parse_date(date_str):
-    if not date_str or date_str in ["--", "N/A"]:
+    if not date_str or date_str in ["--", "N/A", ""]:
         return None
-    date_str = str(date_str).strip()
-    match_iso = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", date_str)
-    if match_iso:
-        y, m, d = match_iso.groups()
-        return f"{y}-{int(m):02d}-{int(d):02d}"
-    match_us = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})", date_str)
-    if match_us:
-        m, d, y = match_us.groups()
-        return f"{y}-{int(m):02d}-{int(d):02d}"
+    # Strip off extra time formats if present (e.g. '2026-05-12T00:00:00' -> '2026-05-12')
+    date_str = str(date_str).strip().split("T")[0].split(" ")[0]
+    
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
     return None
 
 def fetch_senate_data():
@@ -36,11 +35,7 @@ def fetch_senate_data():
     return []
 
 def fetch_official_house_disclosures(years=[2026, 2025, 2024]):
-    """
-    Downloads official House Clerk XML index archives directly from public_disc/financial-pdfs/
-    """
     records = []
-    
     for year in years:
         zip_url = f"https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.ZIP"
         print(f"Downloading official House Clerk Index for {year}: {zip_url}...")
@@ -49,7 +44,6 @@ def fetch_official_house_disclosures(years=[2026, 2025, 2024]):
             if res.status_code == 200:
                 with zipfile.ZipFile(io.BytesIO(res.content)) as z:
                     xml_filename = f"{year}FD.xml"
-                    
                     if xml_filename in z.namelist():
                         with z.open(xml_filename) as f:
                             tree = ET.parse(f)
@@ -58,7 +52,6 @@ def fetch_official_house_disclosures(years=[2026, 2025, 2024]):
                             ptr_count = 0
                             for member in root.findall("Member"):
                                 report_type = member.findtext("FilingType", "").strip() or member.findtext("ReportType", "").strip()
-                                # 'P' signifies Periodic Transaction Report
                                 if report_type == "P":
                                     first_name = member.findtext("First", "").strip()
                                     last_name = member.findtext("Last", "").strip()
@@ -66,18 +59,17 @@ def fetch_official_house_disclosures(years=[2026, 2025, 2024]):
                                     filing_date = member.findtext("FilingDate", "").strip()
                                     doc_id = member.findtext("DocID", "").strip()
                                     
-                                    records.append({
-                                        "representative": full_name,
-                                        "disclosure_date": filing_date,
-                                        "doc_id": doc_id,
-                                        "ticker": f"PTR_{doc_id}",
-                                        "type": "BUY",
-                                        "amount": "$1,001 - $15,000"
-                                    })
-                                    ptr_count += 1
-                            print(f"Successfully extracted {ptr_count} PTR index records for {year}.")
-            else:
-                print(f"House Clerk ZIP for {year} returned HTTP {res.status_code}.")
+                                    if doc_id:
+                                        records.append({
+                                            "representative": full_name,
+                                            "disclosure_date": filing_date,
+                                            "doc_id": doc_id,
+                                            "ticker": f"PTR_{doc_id}",
+                                            "type": "BUY",
+                                            "amount": "$1,001 - $15,000"
+                                        })
+                                        ptr_count += 1
+                            print(f"Extracted {ptr_count} PTR index records for {year}.")
         except Exception as e:
             print(f"Error reading House Clerk ZIP for {year}: {e}")
             
@@ -106,6 +98,9 @@ def ingest_trades():
     conn = get_connection()
     cur = conn.cursor()
     
+    # Expand ticker column size limit dynamically before insertion so PTR_ DOC_IDs don't crash it
+    cur.execute("ALTER TABLE disclosures ALTER COLUMN ticker TYPE VARCHAR(50);")
+    
     cur.execute("TRUNCATE TABLE disclosures CASCADE;")
     cur.execute("TRUNCATE TABLE politicians RESTART IDENTITY CASCADE;")
     
@@ -117,13 +112,14 @@ def ingest_trades():
             name = str(trade.get("representative", "")).strip()
             raw_tx_date = trade.get("disclosure_date")
             raw_disc_date = trade.get("disclosure_date")
+            ticker = str(trade.get("ticker", "")).strip().upper()
+            type_raw = str(trade.get("type", "")).upper()
         else:
             name = str(trade.get("senator", "")).strip()
             raw_tx_date = trade.get("transaction_date")
             raw_disc_date = trade.get("disclosure_date") or raw_tx_date
-
-        ticker = str(trade.get("ticker", "")).strip().upper()
-        type_raw = str(trade.get("type", "")).upper()
+            ticker = str(trade.get("ticker", "")).strip().upper()
+            type_raw = str(trade.get("type", "")).upper()
 
         if "PURCHASE" in type_raw or "BUY" in type_raw:
             tx_type = "BUY"
@@ -136,7 +132,7 @@ def ingest_trades():
         disc_date = parse_date(raw_disc_date) or tx_date
         amount_range = trade.get("amount")
 
-        if not name or not ticker or ticker in ["--", "NONE", "N/A"] or len(ticker) > 25:
+        if not name or not ticker or ticker in ["--", "NONE", "N/A"]:
             continue
         if not tx_date or not tx_type:
             continue
@@ -151,8 +147,10 @@ def ingest_trades():
                 (politician_id, ticker, tx_date, disc_date, tx_type, amount_range)
             )
             records_inserted += 1
-        except Exception:
+        except Exception as e:
             conn.rollback()
+            # If a record still fails, this will now print out why!
+            print(f"Failed inserting {ticker} for {name}: {e}")
             continue
 
     conn.commit()
